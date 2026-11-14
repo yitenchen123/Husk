@@ -22,10 +22,15 @@ set -euo pipefail
 HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DD="${DD:-/tmp/husk_ipa}"
 TROLLSTORE=false
+# A11 (iPhone X and older) has no PPL/TXM: the "banned" JIT entitlements are
+# allowed there, and stripping them kills ART's JIT. TrollStore Lite on these
+# devices needs the entitlements kept. See docs/10-display-fix-zl2-fcl.md.
+A11_TROLLSTORE=false
 OUT=""
 for arg in "$@"; do
     case "$arg" in
         --trollstore|--tipa) TROLLSTORE=true ;;
+        --trollstore-a11) TROLLSTORE=true; A11_TROLLSTORE=true ;;
         *) OUT="${OUT:-$arg}" ;;
     esac
 done
@@ -194,7 +199,7 @@ BANNED_KEYS=(
     "dynamic-codesigning"
     "com.apple.private.skip-library-validation"
 )
-if [ "$TROLLSTORE" = true ]; then
+if [ "$TROLLSTORE" = true ] && [ "$A11_TROLLSTORE" != true ]; then
     for key in "${BANNED_KEYS[@]}"; do
         plutil -remove "$key" "$ENT" 2>/dev/null || true
     done
@@ -208,13 +213,20 @@ sign --entitlements "$ENT" "$SAPP"
 echo "==> entitlements in the signed app:"
 EMBEDDED_ENTS=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)
 REQUIRED_PATTERN="get-task-allow|increased-memory|extended-virtual"
-[ "$TROLLSTORE" != true ] && REQUIRED_PATTERN+="|dynamic-codesigning"
+if [ "$TROLLSTORE" != true ] || [ "$A11_TROLLSTORE" = true ]; then
+    REQUIRED_PATTERN+="|dynamic-codesigning"
+fi
 if ! grep -qE "$REQUIRED_PATTERN" <<< "$EMBEDDED_ENTS"; then
     echo "==> entitlements did not embed; refusing to package" >&2
     rm -rf "$STAGE"
     exit 1
 fi
-if [ "$TROLLSTORE" = true ]; then
+if [ "$A11_TROLLSTORE" = true ] && ! grep -q "dynamic-codesigning" <<< "$EMBEDDED_ENTS"; then
+    echo "==> A11 TrollStore Lite package lost dynamic-codesigning; the Java runtime cannot JIT" >&2
+    rm -rf "$STAGE"
+    exit 1
+fi
+if [ "$TROLLSTORE" = true ] && [ "$A11_TROLLSTORE" != true ]; then
     BANNED_PATTERN=$(IFS='|'; echo "${BANNED_KEYS[*]}")
     if matched=$(grep -oE "$BANNED_PATTERN" <<< "$EMBEDDED_ENTS" | head -n 1) && [ -n "$matched" ]; then
         echo "==> banned entitlement '$matched' found in trollstore package; refusing to package" >&2

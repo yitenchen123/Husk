@@ -63,7 +63,20 @@ public final class ViewRoot implements ViewParent {
     }
     private WindowInsets computeInsets() {
         boolean full = mLp.type == WindowManager.LayoutParams.TYPE_BASE_APPLICATION || mLp.type == WindowManager.LayoutParams.TYPE_APPLICATION;
-        if (!full) return WindowInsets.huskOf(0, 0, 0, 0, Math.max(0, sImeBottom - (screenH() - mY - mH)), null);
+        if (!full) {
+            /* Husk: a dialog, bottom sheet or popup used to receive zero insets here.
+             * A Compose Scaffold then put its bottomBar (ZL2/FCL's download progress)
+             * and the OAuth sheet flush against the physical bottom edge, under the
+             * home indicator, where drawAll() clips it away -- the "dialog sits below
+             * the screen" bug. Report the bars that actually overlap THIS window:
+             * the space already left below the window is subtracted, so a window
+             * clamped into the safe area does not avoid the bottom bar twice. */
+            int below = Math.max(0, screenH() - (mY + mH));
+            int bottom = Math.max(0, sInsets[3] - below);
+            int ime = Math.max(0, sImeBottom - below);
+            int top = Math.max(0, sInsets[1] - Math.max(0, mY));
+            return WindowInsets.huskOf(sInsets[0], top, sInsets[2], bottom, ime, cutout());
+        }
         if (!barsHidden()) {
             // bars showing: the top is the status bar, the bottom the home indicator, the sides only the notch and the screen's
             // corners -- a cutout, which a window that lays out into it (short edges, always) covers. A fullscreen window (no status
@@ -274,20 +287,53 @@ public final class ViewRoot implements ViewParent {
             else hs = View.MeasureSpec.makeMeasureSpec(lh, View.MeasureSpec.EXACTLY);
             mView.measure(ws, hs);
             int w = mView.getMeasuredWidth(), h = mView.getMeasuredHeight();
+            /* A floating window (dialog, bottom sheet, popup) is the one that
+             * composes the login sheet and the download progress bar. */
+            boolean floating = (lw != ViewGroup.LayoutParams.MATCH_PARENT || lh != ViewGroup.LayoutParams.MATCH_PARENT)
+                            || mLp.type >= 1000; /* TYPE_APPLICATION_PANEL and above */
+            if (floating && (w > maxW || h > maxH)) {
+                /* A wrap_content decor measured against the whole screen can be
+                 * taller than the visible area. Gravity.BOTTOM then places it at
+                 * screenHeight - height, pushing most of it off the bottom edge,
+                 * where drawAll() clips it away. Cap it and measure again. */
+                w = Math.min(w, maxW); h = Math.min(h, maxH);
+                mView.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                              View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY));
+                w = mView.getMeasuredWidth(); h = mView.getMeasuredHeight();
+            }
             // where the window goes: gravity and offsets for windows that do not fill the screen (dialogs, popups, toasts)
             int g = mLp.gravity;
             Rect out = new Rect();
             if (g == 0 && (lw != ViewGroup.LayoutParams.MATCH_PARENT || lh != ViewGroup.LayoutParams.MATCH_PARENT)) g = Gravity.TOP | Gravity.LEFT;
             if (g == 0) out.set(0, 0, w, h);
             else {
+                /* Floating windows get the status bar / home indicator through
+                 * computeInsets() instead of by shrinking this rectangle: Compose
+                 * apps set FLAG_LAYOUT_NO_LIMITS and handle insets themselves, but
+                 * the window still has to be reachable on the physical screen. */
                 Rect area = new Rect(0, 0, sw, sh);
-                if (mLp.type >= 1000 || (mLp.flags & WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) == 0 && mLp.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION)
+                if (!floating && (mLp.flags & WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) == 0 && mLp.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION)
                     area.set(sInsets[0], sInsets[1], sw - sInsets[2], sh - Math.max(sInsets[3], sImeBottom));
                 Gravity.apply(g, w, h, area, mLp.x, mLp.y, out);
+                /* Husk: keep the window inside the screen. A negative y offset
+                 * (common for bottom sheets and PopupWindows) or a decor taller
+                 * than the area otherwise lands the dialog below the screen. */
+                int maxX = Math.max(0, sw - w), maxY = Math.max(0, sh - h);
+                out.left = Math.max(0, Math.min(out.left, maxX));
+                out.top = Math.max(0, Math.min(out.top, maxY));
+                out.right = out.left + w;
+                out.bottom = out.top + h;
+            }
+            if (floating && (mX != out.left || mY != out.top || mW != w || mH != h)) {
+                /* computeInsets() subtracts the space below the window: dispatch
+                 * again once the final position is known, so the bottom inset is
+                 * exact and the progress bar is not avoided twice. */
+                mInsetsDirty = true;
             }
             mX = out.left; mY = out.top; mW = w; mH = h;
             mView.layout(0, 0, w, h);
         } finally { mInLayout = false; }
+        if (mInsetsDirty) scheduleFrame();
         mObserver.dispatchOnGlobalLayout();
         if (sDump == null) sDump = System.getenv("TL_VIEW_DUMP") != null;
         if (sDump) {

@@ -60,6 +60,9 @@ final class TLUnityUIView: UIView, UIKeyInput {
     /// mean time one frame takes it. Refreshed once a second from the runtime's own counters.
     private let stats = UILabel()
     private var statsTimer: Timer?
+    /// How much of this view the on-screen keyboard covers, in points. Kept so
+    /// re-sending the safe-area insets never resets the keyboard inset to zero.
+    private var keyboardCovered: CGFloat = 0
 
     /// Called when three fingers tap at once: the way back to the interface while it is hidden.
     var onThreeFingerTap: (() -> Void)?
@@ -185,12 +188,42 @@ final class TLUnityUIView: UIView, UIKeyInput {
         let mine = convert(bounds, to: window)
         let covered = hiding ? 0 : max(0, mine.maxY - window.convert(end, from: nil).minY)
         if engine == .java {
-            let k = contentScaleFactor, inset = windowed ? UIEdgeInsets.zero : window.safeAreaInsets
-            husk_java_set_insets(Int32(inset.left * k), Int32(inset.top * k), Int32(inset.right * k), Int32(inset.bottom * k), Int32((covered * k).rounded()))
+            keyboardCovered = hiding ? 0 : covered
+            pushJavaInsets()
             if hiding, isFirstResponder == false { husk_java_keyboard_closed() }
             return
         }
         husk_flutter_set_keyboard_inset(Int32((covered * contentScaleFactor).rounded()))
+    }
+
+    /// Husk: ZL2 / FCL put their login dialog and download progress in a bottom
+    /// sheet / Scaffold bottomBar. Those windows get their safe-area insets from
+    /// the host. Sending them only once at launch raced the view being added to
+    /// its window: `window.safeAreaInsets` was still zero, so every dialog,
+    /// bottom sheet and progress bar was laid out against the physical bottom
+    /// edge and disappeared below the screen. Re-send on every layout and
+    /// whenever the safe area changes (rotation, status bar, split view).
+    private func pushJavaInsets() {
+        guard engine == .java else { return }
+        let k = contentScaleFactor
+        let inset: UIEdgeInsets
+        if windowed {
+            inset = .zero   // a floating Husk window has no notch or home indicator
+        } else {
+            let own = window?.safeAreaInsets ?? .zero
+            let key = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?.safeAreaInsets ?? .zero
+            // A view that has not been laid out yet can report a zero safe area;
+            // the key window already knows the real one.
+            inset = (own.top == 0 && own.bottom == 0) ? key : own
+        }
+        husk_java_set_insets(Int32(inset.left * k), Int32(inset.top * k),
+                             Int32(inset.right * k), Int32(inset.bottom * k),
+                             Int32((keyboardCovered * k).rounded()))
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        pushJavaInsets()
     }
 
     deinit { statsTimer?.invalidate(); NotificationCenter.default.removeObserver(self) }
@@ -212,6 +245,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
         stats.frame = CGRect(x: bounds.width - 148, y: bounds.height - 22, width: 142, height: 16)
         if let webHost, webHost.frame != frame { webHost.frame = frame }
         guard bounds.width > 0, bounds.height > 0 else { return }
+        pushJavaInsets()
         let w = Int((bounds.width * contentScaleFactor).rounded())
         let h = Int((bounds.height * contentScaleFactor).rounded())
         // An Unreal game draws with MoltenVK, which sizes this layer itself to the swapchain it made; sizing it back here on every layout would leave the layer and the
@@ -246,6 +280,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
             husk_unity_set_paused(true)
             if isFirstResponder { resignFirstResponder() }
         }
+        pushJavaInsets()
         setNeedsLayout()
     }
 
@@ -316,10 +351,9 @@ final class TLUnityUIView: UIView, UIKeyInput {
             husk_java_set_runtime((Bundle.main.resourcePath ?? "") + "/java-runtime", Float(contentScaleFactor))
             husk_java_set_night_mode(traitCollection.userInterfaceStyle == .dark ? 1 : 0)
             // The notch and the home indicator, in surface pixels: the app's window keeps its content out of them.
-            if let inset = windowed ? UIEdgeInsets.zero : window?.safeAreaInsets {
-                let k = contentScaleFactor
-                husk_java_set_insets(Int32(inset.left * k), Int32(inset.top * k), Int32(inset.right * k), Int32(inset.bottom * k), 0)
-            }
+            // pushJavaInsets() re-reads the safe area (it may still be zero this early)
+            // and is called again on every layout / safeAreaInsetsDidChange.
+            pushJavaInsets()
             attachWebHost(fresh: true)
             started = husk_java_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .gamemaker: started = husk_gamemaker_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)

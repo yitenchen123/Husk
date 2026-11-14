@@ -779,9 +779,18 @@ public class WebView extends AbsoluteLayout implements android.view.ViewTreeObse
         // a dialog, popup or menu over the page takes the touches: the page only gets them while its window is the top one
         husk.ViewRoot root = visible ? husk.ViewRoot.of(getRootView()) : null;
         boolean touchable = root != null && root == husk.ViewRoot.topTouchable();
-        if (!force && visible == mFrameVisible && touchable == mFrameTouchable && (!visible || (loc[0] == mFrameX && loc[1] == mFrameY && getWidth() == mFrameW && getHeight() == mFrameH))) return;
-        mFrameVisible = visible; mFrameTouchable = touchable; mFrameX = loc[0]; mFrameY = loc[1]; mFrameW = getWidth(); mFrameH = getHeight();
-        husk.Web.frame(mId, loc[0], loc[1], getWidth(), getHeight(), visible, touchable);
+        int x = loc[0], y = loc[1], w = getWidth(), h = getHeight();
+        if (visible) {
+            /* Husk: a WebView inside a dialog whose window was pushed below the
+             * screen placed its native WKWebView there too, so the OAuth login
+             * sheet could not be seen or tapped. Keep the page on screen. */
+            int sw = husk.Native.screenWidth(), sh = husk.Native.screenHeight();
+            x = Math.max(0, Math.min(x, Math.max(0, sw - w)));
+            y = Math.max(0, Math.min(y, Math.max(0, sh - h)));
+        }
+        if (!force && visible == mFrameVisible && touchable == mFrameTouchable && (!visible || (x == mFrameX && y == mFrameY && w == mFrameW && h == mFrameH))) return;
+        mFrameVisible = visible; mFrameTouchable = touchable; mFrameX = x; mFrameY = y; mFrameW = w; mFrameH = h;
+        husk.Web.frame(mId, x, y, w, h, visible, touchable);
     }
     /** @hide A window came or went: every page says again whether it takes touches. */
     public static void huskWindowsChanged() {

@@ -55,3 +55,5 @@ step "app + IPA"
 mkdir -p "$(dirname "$OUT")"
 ./scripts/package_ipa.sh "$OUT"
 ./scripts/package_ipa.sh --trollstore "${OUT%.ipa}.tipa"
+# A11 (iPhone X) has no PPL/TXM: keep the JIT entitlements for TrollStore Lite.
+./scripts/package_ipa.sh --trollstore-a11 "${OUT%.ipa}-a11.tipa"

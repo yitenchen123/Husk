@@ -1,0 +1,105 @@
+name: Husk build (ZL2 / FCL display fix)
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_ipa:
+        description: 'Also run the full QEMU / ANGLE IPA build (slow, needs many downloaded sources)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast gate: a push must not break Husk's Java framework or the Swift screen
+  # that feeds it. Runs in minutes on a stock macOS runner, no downloads.
+  verify:
+    name: Compile Java framework + parse Swift
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate a JDK
+        run: |
+          JDK="$(/usr/libexec/java_home -v 17 2>/dev/null || /usr/libexec/java_home)"
+          echo "HUSK_JDK=$JDK" >> "$GITHUB_ENV"
+          "$JDK/bin/javac" -version
+          swift --version
+
+      - name: Check shell scripts
+        run: |
+          bash -n scripts/verify_java_framework.sh
+          bash -n scripts/ci_build.sh
+          bash -n scripts/package_ipa.sh
+
+      - name: Compile Husk's Java framework
+        run: bash scripts/verify_java_framework.sh
+
+      - name: Parse the changed Swift file
+        run: swiftc -parse src/app/Husk/TLUnityView.swift
+
+      # ruby/psych ships with macOS; PyYAML does not necessarily.
+      - name: Validate workflow YAML
+        run: ruby -e "require 'yaml'; YAML.load_file('.github/workflows/husk-build.yml'); puts 'YAML OK'"
+
+      - name: Show the display-fix diff
+        run: |
+          git --no-pager log -1 --stat --oneline
+          grep -n "pushJavaInsets\|mInsetsDirty\|dynamic-codesigning" \
+            src/app/Husk/TLUnityView.swift \
+            src/java-framework/src/husk/ViewRoot.java \
+            scripts/package_ipa.sh | head -30
+
+  # Full build is opt-in: it fetches QEMU / ANGLE / MoltenVK / the guest image,
+  # cross-compiles them, then runs xcodebuild. Trigger with workflow_dispatch
+  # -> full_ipa=true to produce Husk.ipa / Husk.tipa / Husk-a11.tipa.
+  ipa:
+    name: Full IPA (QEMU + ANGLE + app)
+    needs: verify
+    if: github.event_name == 'workflow_dispatch' && inputs.full_ipa == 'true'
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tools
+        run: |
+          brew install meson ninja pkg-config xcodegen qemu-img || true
+          rustup target add aarch64-apple-ios
+          JDK="$(/usr/libexec/java_home -v 17 2>/dev/null || /usr/libexec/java_home)"
+          echo "HUSK_JDK=$JDK" >> "$GITHUB_ENV"
+
+      - name: R8 (d8) for the Java runtime
+        run: |
+          mkdir -p tools-dl
+          if ! curl -fL --retry 3 -o tools-dl/r8.jar \
+               https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.5.10/r8-8.5.10.jar; then
+            curl -fL --retry 3 -o tools-dl/r8.jar \
+              https://storage.googleapis.com/r8-releases/raw/8.5.10/r8.jar
+          fi
+          echo "HUSK_D8=$PWD/tools-dl/r8.jar" >> "$GITHUB_ENV"
+
+      - name: Build the IPA
+        run: bash scripts/ci_build.sh build/Husk.ipa
+
+      - name: Upload IPA / TIPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Husk-display-fix
+          path: |
+            build/Husk.ipa
+            build/Husk.tipa
+            build/Husk-a11.tipa
+          if-no-files-found: warn
