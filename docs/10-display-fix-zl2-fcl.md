@@ -41,6 +41,13 @@ ZL2（Zalith Launcher 2）与 FCL（Fold Craft Launcher）在 Husk 的 translati
 5. 键盘唤起时页面只上移键盘高度，不整体漂移；横竖屏切换后弹窗仍 clamp 在屏内。
 6. `TL_VIEW_DUMP=1` 抓 `ViewDump` 日志，断言 `decor.bottom <= screenH()` 且 `WindowInsets.bottom > 0`（非沉浸模式）。
 
+## GitHub Actions 产物说明
+
+- `verify`：javac 全量编译 Java framework、`swiftc -parse`、shell 语法、YAML 校验；**已在 macOS runner 上跑通**。
+- `husk-display-fix-source`：**必定产出**的 artifact，含全部改动文件、可套用的 `husk-display-fix.patch` 和本 README。即使完整 IPA 构建失败也能下载，直接应用到本地仓库。
+- `husk-ipa-build-log`：`if: always()` 上传的 `build/husk-build.log`；失败时还会把日志尾部作为 commit comment 发出来，便于从 API 直接读。
+- `Husk-display-fix`：仅在完整构建成功时才有 `Husk.ipa` / `Husk.tipa` / `Husk-a11.tipa`。**首次完整 IPA run（43652135330）在 “Build the IPA” 步骤 48 秒后失败、无产物**，原因见该次运行的日志/commit comment。完整构建要下载 QEMU / ANGLE / MoltenVK / guest kernel 等外部源码并交叉编译，在 hosted runner 上容易受上游源可用性影响，不要把它当作默认交付路径。
+
 ## 已知限制
 
 - **本仓库改动未经真机验证**：显示效果依赖 ZL2/FCL 具体版本与 Compose 的 insets 消费方式，需按上面的清单实测；编译由 GitHub Actions 验证。

@@ -17,9 +17,13 @@ on:
           - 'false'
           - 'true'
 
+permissions:
+  contents: write
+  actions: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   # Fast gate: a push must not break Husk's Java framework or the Swift screen
@@ -40,9 +44,9 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          bash -n scripts/verify_java_framework.sh
-          bash -n scripts/ci_build.sh
-          bash -n scripts/package_ipa.sh
+          for f in scripts/verify_java_framework.sh scripts/ci_build.sh scripts/package_ipa.sh scripts/make_display_patch.sh; do
+            bash -n "$f"
+          done
 
       - name: Compile Husk's Java framework
         run: bash scripts/verify_java_framework.sh
@@ -54,20 +58,33 @@ jobs:
       - name: Validate workflow YAML
         run: ruby -e "require 'yaml'; YAML.load_file('.github/workflows/husk-build.yml'); puts 'YAML OK'"
 
-      - name: Show the display-fix diff
-        run: |
-          git --no-pager log -1 --stat --oneline
-          grep -n "pushJavaInsets\|mInsetsDirty\|dynamic-codesigning" \
-            src/app/Husk/TLUnityView.swift \
-            src/java-framework/src/husk/ViewRoot.java \
-            scripts/package_ipa.sh | head -30
+  # Always succeeds, always produces a downloadable artifact. If the full IPA
+  # build is blocked by an upstream source, this is still something to install
+  # or apply locally.
+  patch:
+    name: Source patch (always available)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Package the display fix
+        run: bash scripts/make_display_patch.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: husk-display-fix-source
+          path: build/husk-display-fix.zip
+          if-no-files-found: error
 
   # Full build is opt-in: it fetches QEMU / ANGLE / MoltenVK / the guest image,
   # cross-compiles them, then runs xcodebuild. Trigger with workflow_dispatch
-  # -> full_ipa=true to produce Husk.ipa / Husk.tipa / Husk-a11.tipa.
+  # -> full_ipa=true. The log is always uploaded, and on failure its tail is
+  # posted as a commit comment so the reason is readable without opening the UI.
   ipa:
     name: Full IPA (QEMU + ANGLE + app)
-    needs: verify
+    needs: [verify, patch]
     if: github.event_name == 'workflow_dispatch' && inputs.full_ipa == 'true'
     runs-on: macos-15
     timeout-minutes: 350
@@ -76,10 +93,14 @@ jobs:
 
       - name: Build tools
         run: |
-          brew install meson ninja pkg-config xcodegen qemu-img || true
+          brew install meson ninja pkg-config xcodegen qemu-img
+          for t in meson ninja pkg-config xcodegen qemu-img; do
+            command -v "$t" >/dev/null || { echo "missing build tool: $t" >&2; exit 1; }
+          done
           rustup target add aarch64-apple-ios
           JDK="$(/usr/libexec/java_home -v 17 2>/dev/null || /usr/libexec/java_home)"
           echo "HUSK_JDK=$JDK" >> "$GITHUB_ENV"
+          swift --version
 
       - name: R8 (d8) for the Java runtime
         run: |
@@ -89,12 +110,53 @@ jobs:
             curl -fL --retry 3 -o tools-dl/r8.jar \
               https://storage.googleapis.com/r8-releases/raw/8.5.10/r8.jar
           fi
+          test -s tools-dl/r8.jar
           echo "HUSK_D8=$PWD/tools-dl/r8.jar" >> "$GITHUB_ENV"
 
       - name: Build the IPA
-        run: bash scripts/ci_build.sh build/Husk.ipa
+        run: |
+          mkdir -p build
+          set -o pipefail
+          bash -x scripts/ci_build.sh build/Husk.ipa 2>&1 | tee build/husk-build.log
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: husk-ipa-build-log
+          path: build/husk-build.log
+          if-no-files-found: warn
+
+      - name: Post the failure reason as a commit comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          p = 'build/husk-build.log'
+          txt = open(p, errors='replace').read()[-14000:] if os.path.exists(p) else '(no build log was written)'
+          body = ('Husk full IPA build failed at `' + os.environ['SHA'][:8] +
+                  '`. Last lines of build/husk-build.log:\n\n```\n' + txt + '\n```')
+          data = json.dumps({'body': body[:60000]}).encode()
+          url = 'https://api.github.com/repos/' + os.environ['REPO'] + '/commits/' + os.environ['SHA'] + '/comments'
+          q = urllib.request.Request(url, data=data, method='POST', headers={
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'Content-Type': 'application/json',
+              'User-Agent': 'husk-ci'})
+          try:
+              with urllib.request.urlopen(q, timeout=30) as r:
+                  print('comment posted', r.status)
+          except urllib.error.HTTPError as e:
+              print('comment failed', e.code, e.read().decode()[:300])
+          print(txt[-4000:])
+          PY
 
       - name: Upload IPA / TIPA
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Husk-display-fix
