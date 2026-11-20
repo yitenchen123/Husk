@@ -19,6 +19,7 @@ public final class ViewRoot implements ViewParent {
     private static Handler sMain;
     private static int sNextViewId = 0x00100000;
     private static int[] sInsets = { 0, 0, 0, 0 };     /* left, top, right, bottom: the notch / status bar and home indicator areas */
+    private static int[] sEffective;                    /* sInsets, or the derived safe area when the host reported nothing */
     private static int sImeBottom;
     private static ViewRoot sTouchTarget;
 
@@ -72,10 +73,10 @@ public final class ViewRoot implements ViewParent {
              * the space already left below the window is subtracted, so a window
              * clamped into the safe area does not avoid the bottom bar twice. */
             int below = Math.max(0, screenH() - (mY + mH));
-            int bottom = Math.max(0, sInsets[3] - below);
+            int bottom = Math.max(0, ins()[3] - below);
             int ime = Math.max(0, sImeBottom - below);
-            int top = Math.max(0, sInsets[1] - Math.max(0, mY));
-            return WindowInsets.huskOf(sInsets[0], top, sInsets[2], bottom, ime, cutout());
+            int top = Math.max(0, ins()[1] - Math.max(0, mY));
+            return WindowInsets.huskOf(ins()[0], top, ins()[2], bottom, ime, cutout());
         }
         if (!barsHidden()) {
             // bars showing: the top is the status bar, the bottom the home indicator, the sides only the notch and the screen's
@@ -87,7 +88,7 @@ public final class ViewRoot implements ViewParent {
             boolean into = mode == WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES || mode == WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
             boolean fs = (wa.flags & WindowManager.LayoutParams.FLAG_FULLSCREEN) != 0;
             if (!into && !fs) return screenInsets();
-            return WindowInsets.huskOf(into ? 0 : sInsets[0], sInsets[1], into ? 0 : sInsets[2], fs ? 0 : sInsets[3], sImeBottom, cutout());
+            return WindowInsets.huskOf(into ? 0 : ins()[0], ins()[1], into ? 0 : ins()[2], fs ? 0 : ins()[3], sImeBottom, cutout());
         }
         // bars hidden (immersive): no bar insets; what is left is the cutout, unless the window lays out into it (short edges, always),
         // in which case the app gets the whole screen and keeps its UI clear of the notch itself (getDisplayCutout)
@@ -169,7 +170,7 @@ public final class ViewRoot implements ViewParent {
     public WindowInsets insets() { return mWindowInsets; }
     public int systemUi() { return mSystemUi; }
     public void systemUiChanged(int v) { mSystemUi = v; requestApplyInsets(); if (mSysUiTold >= 0) tellSystemUi(); }
-    public void visibleDisplayFrame(Rect r) { r.set(sInsets[0], sInsets[1], screenW() - sInsets[2], screenH() - Math.max(sInsets[3], sImeBottom)); }
+    public void visibleDisplayFrame(Rect r) { r.set(ins()[0], ins()[1], screenW() - ins()[2], screenH() - Math.max(ins()[3], sImeBottom)); }
     public WindowInsetsController insetsController() {
         if (mInsetsController == null) mInsetsController = new WindowInsetsController() {
             int appearance, behavior;
@@ -191,14 +192,49 @@ public final class ViewRoot implements ViewParent {
 
     // ---- insets from the host
     /** The screen's insets in pixels (Husk's host tells them), and the keyboard's height. */
-    public static void setInsets(int l, int t, int r, int b) { sInsets = new int[] { l, t, r, b }; for (ViewRoot v : sRoots) v.requestApplyInsets(); }
-    public static void setImeHeight(int h) { if (h != sImeBottom) { sImeBottom = h; for (ViewRoot v : sRoots) v.requestApplyInsets(); } }
+    /**
+     * The effective screen insets. The host sends the iOS safe area through
+     * Native.insets(), but on a cold start the view is often not in a window
+     * yet when it is first sampled, so the array is all zeros -- and on some
+     * launches that sample is never repeated. Compose login sheets and Scaffold
+     * bottomBars then lay out against the physical bottom edge and get clipped
+     * away: the ZL2 / FCL "dialog sits below the screen" bug.
+     *
+     * Only a fallback: as soon as the host reports real insets, those win.
+     */
+    private static int[] ins() {
+        if (sEffective == null) {
+            int[] s = sInsets;
+            sEffective = (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                       ? fallbackInsets() : s;
+        }
+        return sEffective;
+    }
+    private static int dpPx(int dp, float d) { return Math.round(dp * d); }
+    /** Notch / home-indicator geometry for full-screen iPhones, derived from the surface's point size. */
+    private static int[] fallbackInsets() {
+        float d = Native.density();
+        int w = screenW(), h = screenH();
+        if (d <= 0 || w <= 0 || h <= 0) return new int[] { 0, 0, 0, 0 };
+        int wpt = Math.round(w / d), hpt = Math.round(h / d);
+        int shortSide = Math.min(wpt, hpt), longSide = Math.max(wpt, hpt);
+        if (shortSide < 320 || shortSide > 440 || longSide < 640 || longSide > 1000)
+            return new int[] { 0, 0, 0, 0 };   /* not a phone-sized full-screen display */
+        if (w > h) return new int[] { dpPx(44, d), 0, dpPx(44, d), dpPx(21, d) };   /* landscape: notch on both sides */
+        return new int[] { 0, dpPx(44, d), 0, dpPx(34, d) };                        /* portrait: status bar + home indicator */
+    }
+    public static void setInsets(int l, int t, int r, int b) {
+        sInsets = new int[] { l, t, r, b };
+        sEffective = null;
+        for (ViewRoot v : sRoots) v.requestApplyInsets();
+    }
+    public static void setImeHeight(int h) { if (h != sImeBottom) { sImeBottom = h; sEffective = null; for (ViewRoot v : sRoots) v.requestApplyInsets(); } }
     public static int imeHeight() { return sImeBottom; }
-    public static int[] screenInsetsHusk() { return sInsets; }
-    public static WindowInsets screenInsets() { return WindowInsets.huskOf(sInsets[0], sInsets[1], sInsets[2], sInsets[3], sImeBottom, cutout()); }
+    public static int[] screenInsetsHusk() { return ins(); }
+    public static WindowInsets screenInsets() { return WindowInsets.huskOf(ins()[0], ins()[1], ins()[2], ins()[3], sImeBottom, cutout()); }
     /** The notch and the screen's rounded corners: the host's safe area on the sides and top (the bottom is the home indicator, a bar). */
     public static DisplayCutout cutout() {
-        return sInsets[0] > 0 || sInsets[1] > 0 || sInsets[2] > 0 ? new DisplayCutout(new Rect(sInsets[0], sInsets[1], sInsets[2], 0), null) : null;
+        return ins()[0] > 0 || ins()[1] > 0 || ins()[2] > 0 ? new DisplayCutout(new Rect(ins()[0], ins()[1], ins()[2], 0), null) : null;
     }
     static int screenW() { return Native.screenWidth(); }
     static int screenH() { return Native.screenHeight(); }
@@ -313,7 +349,7 @@ public final class ViewRoot implements ViewParent {
                  * the window still has to be reachable on the physical screen. */
                 Rect area = new Rect(0, 0, sw, sh);
                 if (!floating && (mLp.flags & WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) == 0 && mLp.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION)
-                    area.set(sInsets[0], sInsets[1], sw - sInsets[2], sh - Math.max(sInsets[3], sImeBottom));
+                    area.set(ins()[0], ins()[1], sw - ins()[2], sh - Math.max(ins()[3], sImeBottom));
                 Gravity.apply(g, w, h, area, mLp.x, mLp.y, out);
                 /* Husk: keep the window inside the screen. A negative y offset
                  * (common for bottom sheets and PopupWindows) or a decor taller
