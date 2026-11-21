@@ -299,6 +299,30 @@ public final class ViewRoot implements ViewParent {
         android.util.Log.d("ViewDump", b.toString());
         if (v instanceof android.view.ViewGroup) { android.view.ViewGroup g = (android.view.ViewGroup) v; for (int i = 0; i < g.getChildCount(); i++) dump(g.getChildAt(i), depth + 1); }
     }
+    /** Husk: keep a nested bottom sheet / popup on the visible part of the screen. */
+    private static void clampOverlay(View v, int depth, int screenH, boolean scrolling) {
+        if (v == null || depth > 6 || !(v instanceof ViewGroup)) return;
+        ViewGroup g = (ViewGroup) v;
+        boolean scroll = scrolling || v instanceof android.widget.ScrollView
+                       || v instanceof android.widget.AbsListView
+                       || v instanceof android.widget.HorizontalScrollView;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            if (c.getVisibility() != View.VISIBLE || c.getWidth() <= 0 || c.getHeight() <= 0) continue;
+            if (!scroll) {
+                int bottom = c.getBottom();
+                /* Only a view whose own size fits the screen but whose bottom
+                 * fell past it. A full-height container is never shifted. */
+                if (c.getHeight() < screenH && bottom > screenH + 2 && c.getTop() > 0) {
+                    int dy = screenH - bottom;
+                    c.offsetTopAndBottom(dy);
+                    android.util.Log.d("HuskLayout", "clamped " + c.getClass().getName()
+                            + " from " + bottom + " to " + screenH + " (dy=" + dy + ")");
+                }
+            }
+            clampOverlay(c, depth + 1, screenH, scroll);
+        }
+    }
     private void performLayout() {
         int sw = screenW(), sh = screenH();
         if (mInsetsDirty || mFirst) {
@@ -351,16 +375,19 @@ public final class ViewRoot implements ViewParent {
                 if (!floating && (mLp.flags & WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS) == 0 && mLp.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION)
                     area.set(ins()[0], ins()[1], sw - ins()[2], sh - Math.max(ins()[3], sImeBottom));
                 Gravity.apply(g, w, h, area, mLp.x, mLp.y, out);
-                /* Husk: keep the window inside the screen. A negative y offset
-                 * (common for bottom sheets and PopupWindows) or a decor taller
-                 * than the area otherwise lands the dialog below the screen. */
-                int maxX = Math.max(0, sw - w), maxY = Math.max(0, sh - h);
-                out.left = Math.max(0, Math.min(out.left, maxX));
-                out.top = Math.max(0, Math.min(out.top, maxY));
-                out.right = out.left + w;
-                out.bottom = out.top + h;
             }
-            if (floating && (mX != out.left || mY != out.top || mW != w || mH != h)) {
+            /* Husk: ALWAYS keep the window rectangle inside the screen. This used
+             * to run only for `floating` windows, but a Compose Dialog (ZL2/FCL's
+             * Microsoft login sheet) is a MATCH_PARENT window whose *content* is
+             * positioned by a nested Gravity.BOTTOM, so it slipped through and
+             * the sheet landed below the physical bottom edge. Applies to every
+             * window; a full-screen game window is (0,0,sw,sh) and unchanged. */
+            int maxX = Math.max(0, sw - w), maxY = Math.max(0, sh - h);
+            out.left = Math.max(0, Math.min(out.left, maxX));
+            out.top = Math.max(0, Math.min(out.top, maxY));
+            out.right = out.left + w;
+            out.bottom = out.top + h;
+            if (mX != out.left || mY != out.top || mW != w || mH != h) {
                 /* computeInsets() subtracts the space below the window: dispatch
                  * again once the final position is known, so the bottom inset is
                  * exact and the progress bar is not avoided twice. */
@@ -368,6 +395,13 @@ public final class ViewRoot implements ViewParent {
             }
             mX = out.left; mY = out.top; mW = w; mH = h;
             mView.layout(0, 0, w, h);
+            /* The window itself can be full-screen while a bottom sheet inside
+             * it is laid out with a container taller than the screen (a stale
+             * portrait height, or a doubled navigation-bar inset). drawAll()
+             * clips to the screen bitmap, so such a sheet simply vanishes below
+             * the edge. Pull shallow overlay views back into view. Scrollable
+             * containers are skipped: their children are legitimately offscreen. */
+            clampOverlay(mView, 0, h, false);
         } finally { mInLayout = false; }
         if (mInsetsDirty) scheduleFrame();
         mObserver.dispatchOnGlobalLayout();

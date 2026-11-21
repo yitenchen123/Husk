@@ -65,24 +65,50 @@ echo "app: $APP"
 echo '--- java-runtime before ---'
 ls -lh "$APP/java-runtime" | head -30
 
+step "dex inventory in the upstream app"
+echo "--- new dex (this checkout) ---"
+for dex in "$JRT"/*.dex; do
+    echo "  NEW  $(basename "$dex")  $(wc -c < "$dex") bytes  $(sha256sum "$dex" 2>/dev/null || shasum -a 256 "$dex")"
+done
+echo "--- upstream dex inside Payload ---"
+UPDEX=()
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    UPDEX+=("$f")
+    echo "  OLD  ${f#$APP/}  $(wc -c < "$f") bytes  $(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f")"
+done < <(find "$APP" -name '*.dex' -type f | sort)
+[ "${#UPDEX[@]}" -gt 0 ] || { echo 'upstream IPA has NO dex at all' >&2; exit 1; }
+
 step "replace dex files with the freshly compiled ones"
+# Husk's runtime loads husk-framework-core.dex when an AOSP framework.jar is
+# bundled, otherwise husk-framework.dex (see husk-tl-aosp.c). Both must ship.
+# Map by exact name first; if upstream used a different name, map by "core" in
+# the filename so a renamed core dex still receives the right bytecode.
 replaced=0
+for target in "${UPDEX[@]}"; do
+    base="$(basename "$target")"
+    src=""
+    if [ -f "$JRT/$base" ]; then
+        src="$JRT/$base"
+    elif [[ "$base" == *core* ]] && [ -f "$JRT/husk-framework-core.dex" ]; then
+        src="$JRT/husk-framework-core.dex"
+    elif [ -f "$JRT/husk-framework.dex" ]; then
+        src="$JRT/husk-framework.dex"
+    fi
+    [ -n "$src" ] || { echo "no source dex for $base" >&2; exit 1; }
+    cp "$src" "$target"
+    echo "  replaced ${target#$APP/}  <=  $(basename "$src")"
+    replaced=$((replaced + 1))
+done
+# Make sure both canonical names exist even if upstream shipped only one.
 for dex in "$JRT"/*.dex; do
     name="$(basename "$dex")"
-    found=0
-    # Replace every same-named dex inside the app bundle (normally java-runtime/).
-    while IFS= read -r target; do
-        cp "$dex" "$target"
-        echo "  replaced ${target#$APP/}"
-        replaced=$((replaced + 1)); found=$((found + 1))
-    done < <(find "$APP" -name "$name" -type f)
-    if [ "$found" -eq 0 ]; then
-        # Upstream renamed the dex: still put ours next to it so the fix ships.
-        cp "$dex" "$APP/java-runtime/$name"
-        echo "  added java-runtime/$name (no same-named dex upstream)"
-        replaced=$((replaced + 1))
-    fi
+    [ -f "$APP/java-runtime/$name" ] || { cp "$dex" "$APP/java-runtime/$name"; echo "  added java-runtime/$name"; }
 done
+echo "--- dex hashes AFTER replacement ---"
+while IFS= read -r f; do
+    echo "  AFTER  ${f#$APP/}  $(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f")"
+done < <(find "$APP" -name '*.dex' -type f | sort)
 [ "$replaced" -gt 0 ] || { echo 'no dex could be placed inside the app' >&2; exit 1; }
 
 step "stamp the build identity"

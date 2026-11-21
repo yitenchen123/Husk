@@ -57,6 +57,29 @@ jobs:
             build/Husk-fixed-a11.tipa
           if-no-files-found: error
 
+      - name: Post the repack diagnostics as a commit comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          p = 'build/repack.log'
+          txt = open(p, errors='replace').read()[-30000:] if os.path.exists(p) else '(no log)'
+          body = 'Repack diagnostics for ' + os.environ['SHA'][:8] + ':\n\n```\n' + txt + '\n```'
+          url = 'https://api.github.com/repos/' + os.environ['REPO'] + '/commits/' + os.environ['SHA'] + '/comments'
+          q = urllib.request.Request(url, data=json.dumps({'body': body[:60000]}).encode(), method='POST', headers={
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'Content-Type': 'application/json', 'User-Agent': 'husk-ci'})
+          try:
+              with urllib.request.urlopen(q, timeout=30) as r: print('comment', r.status)
+          except urllib.error.HTTPError as e:
+              print('comment failed', e.code, e.read().decode()[:300])
+          PY
+
       # A Release gives the user a permanent, directly downloadable URL.
       - name: Publish a Release with the IPA
         env:
